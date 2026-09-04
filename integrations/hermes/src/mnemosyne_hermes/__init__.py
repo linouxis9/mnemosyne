@@ -135,7 +135,7 @@ except Exception as _persona_import_exc:  # pragma: no cover - graceful import f
         def _with_persona_block(self, base: str) -> str:
             return base
 
-__version__ = "0.5.0"
+__version__ = "0.5.0+valentin.1"
 
 logger = logging.getLogger(__name__)
 
