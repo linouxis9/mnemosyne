@@ -1168,6 +1168,18 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             )
         return ""
 
+    _SANITIZE_NAME_RE = __import__('re').compile(r'^\[[^\]]{1,60}\]\s*')
+
+    @staticmethod
+    def _sanitize_prefetch_query(q: str) -> str:  # PATCH semgate v2: gateway [Name] stamps are metadata, not topical tokens — stripped from the QUERY only; capture/consolidation keep stamped text for attribution
+        q = (q or '').strip()
+        for _ in range(2):
+            m = MnemosyneMemoryProvider._SANITIZE_NAME_RE.match(q)
+            if not m:
+                break
+            q = q[m.end():]
+        return q.strip()
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall relevant context via Mnemosyne hybrid search with temporal weighting.
         
