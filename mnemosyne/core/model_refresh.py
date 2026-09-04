@@ -159,6 +159,7 @@ Rules:
 - Each proposal must cite at least one evidence id from the input.
 - Prefer compact slot bodies that can be stored as canonical facts.
 - If nothing is durable enough, return [].
+- Write every slot body in FRENCH (the conversation language). Keep proper nouns, product names, and technical identifiers in their original spelling. JSON keys stay English.
 
 Memories:
 {memories}
