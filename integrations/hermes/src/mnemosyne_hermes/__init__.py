@@ -1165,10 +1165,27 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
         try:
             import os
             author_id = self._beam.author_id or os.environ.get("MNEMOSYNE_AUTHOR_ID")
+            _q_sanitized = self._sanitize_prefetch_query(query)  # PATCH semgate v2
+            if not _q_sanitized:
+                return ""
             recall_kwargs: Dict[str, Any] = dict(
-                query=query, top_k=max(_PREFETCH_TOP_K * 2, 16),
-                temporal_weight=0.2, temporal_halflife=48,
+                query=_q_sanitized, top_k=60, source="sleep_consolidation",  # PATCH knobs-v2 fix4: episodic-only race — raw rows never inject (pull-only), so they must not eat ranking slots; canonicals have their own path; mnemosyne_recall keeps full raw access
+                temporal_weight=0.1, temporal_halflife=720,  # PATCH knobs-v2 fix2: companion memory must not punish old items; 30-day halflife, halved weight
             )
+            # PATCH self-echo v2 (2026-08-26): never inject rows written by the CURRENT
+            # conversation. Use the provider's OWN beam session (self._session_id,
+            # derived from gateway_session_key at initialize — the exact prefix rows
+            # are stored under). The prefetch kwarg session_id does NOT match the
+            # stored row session_id in gateway mode (v1 no-op'd; the cooldown was
+            # masking it until a gateway restart wiped the module map).
+            _self_session = getattr(self, "_session_id", None) or (f"hermes_{session_id}" if session_id else None)
+            if _self_session:
+                # exclude the prefixed (live capture) AND bare (reseed replay) variants —
+                # the beam WHERE uses a single != so pass the live one; the bare variant
+                # is excluded via the second WHERE clause.
+                recall_kwargs["exclude_session_id"] = _self_session
+                _bare = _self_session[7:] if _self_session.startswith("hermes_") else f"hermes_{_self_session}"
+                recall_kwargs["exclude_session_id_alt"] = _bare
             # Only pass author_id when explicitly non-empty.  Passing an empty
             # falsy author_id is harmless (no (1=1) bypass), but passing a real
             # non-empty one triggers the (1=1) clause in beam.recall() that

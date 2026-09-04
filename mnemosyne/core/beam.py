@@ -5464,7 +5464,9 @@ class BeamMemory:
                fts_weight: float = None,
                importance_weight: float = None,
                explain: bool = False,
-               _cross_session: Optional[bool] = None) -> List[Dict]:
+               _cross_session: Optional[bool] = None,
+               exclude_session_id: Optional[str] = None,
+               exclude_session_id_alt: Optional[str] = None) -> List[Dict]:  # PATCH self-echo + dual-key
         """
         Hybrid recall across working_memory + episodic_memory.
         Uses sqlite-vec + FTS5 for episodic, FTS5 for working.
@@ -5676,6 +5678,21 @@ class BeamMemory:
             wm_where_clauses.append(_session_scope_filter(cross_session=cross_session))
             wm_params.extend(_session_scope_params(self.session_id, cross_session=cross_session))
         
+        # PATCH self-echo v3 (2026-08-27): exclude current-session rows ONLY when recent
+        # (< SELF_ECHO_WINDOW) — fresh captures are verbatim in the context window.
+        # v2's blanket key exclusion nuked the whole reseeded channel history
+        # (355 rows under the same session key: Deauville/Gantois material).
+        _echo_cutoff = None
+        if exclude_session_id or exclude_session_id_alt:
+            _hours = float(os.environ.get("MNEMOSYNE_SELF_ECHO_HOURS", "6") or 6)
+            _echo_cutoff = (datetime.now() - timedelta(hours=_hours)).isoformat()
+            _variants = [v for v in (exclude_session_id, exclude_session_id_alt) if v]
+            wm_where_clauses.append(
+                "(COALESCE(session_id, '') NOT IN (%s) OR timestamp <= ?)" % ",".join("?" * len(_variants))
+            )
+            wm_params.extend(_variants)
+            wm_params.append(_echo_cutoff)
+
         if from_date:
             wm_where_clauses.append("timestamp >= ?")
             wm_params.append(f"{from_date}T00:00:00")
