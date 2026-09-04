@@ -274,6 +274,7 @@ if _emb_dim_env is not None:
 else:
     EMBEDDING_DIM = _embeddings.EMBEDDING_DIM
 WORKING_MEMORY_MAX_ITEMS = int(os.environ.get("MNEMOSYNE_WM_MAX_ITEMS", "10000"))
+RECALL_CONTENT_CAP = int(os.environ.get("MNEMOSYNE_RECALL_CONTENT_CAP", "4000"))  # PATCH 2026-08-26: was hardcoded [:500] at 8 sites — invisible truncation of every recalled row
 WORKING_MEMORY_TTL_HOURS = int(os.environ.get("MNEMOSYNE_WM_TTL_HOURS", "168"))
 WM_BUMP_CAP_HOURS = int(os.environ.get("MNEMOSYNE_WM_BUMP_CAP_HOURS", "24"))
 WM_PINNED_IDS = set(
@@ -5830,7 +5831,7 @@ class BeamMemory:
                     _wm_vec_kept += 1
                 results.append({
                     "id": row["id"],
-                    "content": row["content"][:500],
+                    "content": row["content"][:RECALL_CONTENT_CAP],
                     "source": row["source"],
                     "timestamp": row["timestamp"],
                     "tier": "working",
@@ -5900,7 +5901,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -5962,7 +5963,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -6023,7 +6024,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "working",
@@ -6084,7 +6085,7 @@ class BeamMemory:
                         score *= (1.0 + temporal_weight * t_boost)
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -6310,7 +6311,7 @@ class BeamMemory:
                 _em_vec_kept += 1
             results.append({
                 "id": row["id"],
-                "content": row["content"][:500],
+                "content": row["content"][:RECALL_CONTENT_CAP],
                 "source": row["source"],
                 "timestamp": row["timestamp"],
                 "tier": "episodic",
@@ -6414,7 +6415,7 @@ class BeamMemory:
                     _em_fallback_kept += 1
                     results.append({
                         "id": row["id"],
-                        "content": row["content"][:500],
+                        "content": row["content"][:RECALL_CONTENT_CAP],
                         "source": row["source"],
                         "timestamp": row["timestamp"],
                         "tier": "episodic",
@@ -6566,7 +6567,7 @@ class BeamMemory:
                         for _row in _src_rows:
                             results.append({
                                 "id": f"memoria_source_{_row['id']}",
-                                "content": _row["content"][:500],
+                                "content": _row["content"][:RECALL_CONTENT_CAP],
                                 "source": _row["source"],
                                 "timestamp": _row["timestamp"],
                                 "tier": "memoria_source",
