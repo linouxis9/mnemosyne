@@ -8578,10 +8578,16 @@ class BeamMemory:
                 # the claim survives -- the rows show as consolidated but
                 # without a summary. That's preferable to a phantom-summary-
                 # without-claim race the previous ordering allowed.
+                _event_ts = None  # PATCH event-ts: items inherit the event date (MAX of source rows), not the run date
+                try:
+                    _event_ts = max((r["timestamp"] for r in rows if r["timestamp"]), default=None)
+                except Exception:
+                    _event_ts = None
                 self.consolidate_to_episodic(
                     summary=summary,
                     source_wm_ids=ids,
                     source="sleep_consolidation",
+                    event_timestamp=_event_ts,
                     importance=0.6,
                     scope=aggregated_scope,
                     valid_until=aggregated_valid_until,
