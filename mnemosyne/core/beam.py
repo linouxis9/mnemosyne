@@ -8504,10 +8504,18 @@ class BeamMemory:
                                 self.invalidate(older_id, replacement_id=newer_id)
                             conflicts_resolved += 1
                 else:
-                    for older_id, newer_id in conflicts:
-                        if not dry_run:
-                            self.invalidate(older_id, replacement_id=newer_id)
-                    conflicts_resolved += len(conflicts)
+                    # PATCH conflictsafe (audit #2 F3/D4): the heuristic-only branch
+                    # auto-invalidated every similar pair — with English stopwords +
+                    # EN embeddings on French text this was a random-pair generator
+                    # (357 working rows mass-killed 08-27). Heuristics alone must
+                    # NEVER invalidate: log only, reserve invalidation for the
+                    # LLM-validated path above.
+                    if conflicts:
+                        logger.info(
+                            "conflict heuristics: %d pairs detected, NOT auto-invalidating (LLM validation unavailable)",
+                            len(conflicts),
+                        )
+                    conflicts_resolved += 0
 
             # --- Try LLM summarization (chunked to fit context) ---
             summary = None
