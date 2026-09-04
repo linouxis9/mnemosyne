@@ -211,6 +211,8 @@ def _format_prefetch_content(content: str, limit: int) -> str:
 
 
 _PREFETCH_TOP_K = 5
+_INJECT_COOLDOWN_S = 24 * 3600
+_MODULE_INJECTED_AT = {}  # PATCH cooldown v2: module-level — the gateway builds a fresh provider per turn; instance state dies  # PATCH cooldown: re-inject only after a day (context may have been compacted by then)
 _PREFETCH_MIN_FRAGMENT_CHARS = 8
 _PREFETCH_FRAGMENT_STOPWORDS = frozenset({
     "a", "an", "and", "are", "as", "be", "but", "by", "do", "for", "go",
@@ -1216,7 +1218,16 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             # also have a real topical signal. Raw transcript rows need a
             # stronger topical signal than distilled facts/preferences.
             filtered = []
+            _T_DENSE = float(os.environ.get('MNEMOSYNE_GATE_T_DENSE', '0.85'))  # PATCH semgate v2
+            _T_LEX_STRONG = float(os.environ.get('MNEMOSYNE_GATE_T_LEX_STRONG', '0.50'))
+            _T_LEX = float(os.environ.get('MNEMOSYNE_GATE_T_LEX', '0.15'))
+            _T_LEX_C = float(os.environ.get('MNEMOSYNE_GATE_T_LEX_C', '0.30'))
+            _T_SEM_C = float(os.environ.get('MNEMOSYNE_GATE_T_SEM_C', '0.60'))
             for r in results:
+                # PATCH pull-only (2026-08-26): raw transcript rows are NEVER injected —
+                # distillation material only. Manual mnemosyne_recall has its own path.
+                if _prefetch_is_raw(r):
+                    continue
                 if _is_low_quality_prefetch(r.get("content", "")):
                     continue
                 if _prefetch_source_quality(r) <= 0:
@@ -1224,17 +1235,46 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 signal = _prefetch_topic_signal(r)
                 score = float(r.get("score") or 0.0)
                 importance = float(r.get("importance") or 0.0)
-                required_signal = 0.18 if _prefetch_is_raw(r) else 0.08
-                if signal < required_signal:
+                _sem = float(r.get('dense_score') or 0.0)  # PATCH semgate v2: core-normalized (KNN-batch min-max) — one basin, no gate re-norm
+                _lex_pure = max(float(r.get('keyword_score') or 0.0), float(r.get('fts_score') or 0.0))  # PATCH semgate v2: PURE lexical — _prefetch_topic_signal's blended fallback fabricates signal for kw=0/fts=0 rows
+                _admit = (_sem >= _T_DENSE and _lex_pure >= _T_LEX) or (_lex_pure >= _T_LEX_STRONG) or (_lex_pure >= _T_LEX_C and _sem >= _T_SEM_C)  # PATCH semgate v2: three-path admission calibrated 17/19 — A strong-sem+corroboration, B lexical-strong, C moderate-moderate
+                if not _admit:
                     continue
+                r = dict(r)
+                r['_dense_norm'] = _sem
+                required_signal = (0.45 if _prefetch_is_raw(r) else 0.30)  # floors v4 (CALIBRATED 2026-08-27): item kw/fts signal 0.34-0.60 for pertinent items (rank 1-2 measured); 0.65 was for kitchen-sink blocks. Raw floor 0.45 unused (pull-only) but kept.
+                _shadow = os.environ.get("MNEMOSYNE_SHADOW_FLOORS", "") in ("1", "true")
+                if _shadow:
+                    logger.info("SHADOW-FLOOR row=%s sig=%.3f floor=%.2f would_pass=%s", str(r.get("id"))[:12], signal, required_signal, signal >= required_signal)
+                if False and signal < required_signal and not _shadow:  # PATCH semgate v2: old kw-only floor superseded by _admit (kept for shadow-log reference)
+                    continue
+                # PATCH knobs-v2 fix1: the unconditional residual drop above made shadow
+                # mode a no-op (rows logged would_pass then dropped anyway). Shadow now
+                # truly observes: floor-relaxed rows pass and get logged.
                 if score < 0.20 and importance < 0.65:
                     continue
                 filtered.append(r)
 
             if canonical_rows:
                 filtered.extend(canonical_rows)
-            filtered.sort(key=_prefetch_adjusted_score, reverse=True)
+            _SEM_W = float(os.environ.get('MNEMOSYNE_GATE_SEM_W', '0.5'))  # PATCH semgate v2
+            filtered.sort(key=lambda r: _prefetch_adjusted_score(r) + _SEM_W * r.get('_dense_norm', 0.0), reverse=True)
+            # PATCH cooldown (2026-08-26): a memory injected in the last
+            # _INJECT_COOLDOWN_S is NOT re-injected — it is already verbatim in
+            # the context window (same principle as self-echo, across turns).
+            _now = time.time()
+            _inj = {k: v for k, v in _MODULE_INJECTED_AT.items() if _now - v < _INJECT_COOLDOWN_S}
+            _MODULE_INJECTED_AT.clear()
+            _MODULE_INJECTED_AT.update(_inj)
+            # PATCH cooldown v3: very-high-signal rows (>0.8) bypass — a critical
+            # daily recall must not be starved by the 24h window.
+            _bypass_gap = float(os.environ.get('MNEMOSYNE_BYPASS_MIN_GAP_S', '21600'))  # PATCH semgate v2: v3 bypass sat inside the pertinent range so hot items re-injected hourly; bypass now also requires >6h since last injection
+            filtered = [r for r in filtered if r.get("id") not in _inj or (_now - _inj[r.get("id")] > _bypass_gap and _prefetch_adjusted_score(r) > 0.55)]  # PATCH knobs-v2 fix3: bypass recalibrated to the kw/fts adjusted-score scale (measured pertinent 0.34-0.60); 0.8 was the legacy component scale and could never fire
             filtered = _semantic_dedup_prefetch(filtered)[:_PREFETCH_TOP_K]
+            for r in filtered:
+                _rid = r.get("id")
+                if _rid:
+                    _MODULE_INJECTED_AT[_rid] = _now
             if not filtered:
                 return ""
             lines = ["## Mnemosyne Context"]
@@ -1399,6 +1439,11 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
 
     def _maybe_auto_sleep(self) -> None:
         try:
+            # PATCH regen-lock (2026-08-26): never auto-sleep while a regen is in flight
+            import os as _os
+            if _os.path.exists('/root/.hermes/profiles/discord/mnemosyne/regen.lock'):
+                logger.info('auto-sleep skipped: regen lock active')
+                return
             stats = self._beam.get_working_stats()
             working = stats.get("total", 0)
             if working > self._auto_sleep_threshold:
