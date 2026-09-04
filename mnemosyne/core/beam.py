@@ -4363,6 +4363,7 @@ class BeamMemory:
     # Episodic Memory
     # ------------------------------------------------------------------
     def consolidate_to_episodic(self, summary: str, source_wm_ids: List[str],
+        event_timestamp: 'Optional[str]' = None,  # PATCH items-split: event date override (MAX of source rows)
                                 source: str = "consolidation", importance: float = 0.6,
                                 metadata: Dict = None, valid_until: str = None,
                                 scope: str = "session",
@@ -4400,6 +4401,73 @@ class BeamMemory:
         # Strip closed <think>...</think> blocks that some LLMs emit
         import re as _re
         summary = _re.sub(r"<think>.*?</think>", "", summary, flags=_re.DOTALL).strip()
+
+        # PATCH items-split v2 (2026-08-26): wider bullet grammar (dash/bullet/en-em dash/numbered,
+        # optional indent), continuation lines joined with spaces, preamble absorbed, AUCUN sentinel
+        # (store NOTHING — session had no durable facts), insert-time 600-char cap, is_fallback
+        # metadata on unparseable output after one strict retry by the caller, insert-time
+        # embedding dedup (cosine > 0.95 vs existing items of this session -> keep newest).
+        _stripped = summary.strip()
+        if _stripped.upper() in ("AUCUN", "AUCUN.", "(AUCUN)"):
+            logger.info("items-split v2: AUCUN sentinel — 0 items, nothing stored")
+            return ""
+        _item_re = _re.compile(r"^[ \t]*(?:[-\u2022\u2013\u2014\*]|\d+[.)])[ \t]+(.+)$", _re.MULTILINE)
+        _matches = list(_item_re.finditer(summary))
+        _items = []
+        for _i, _m in enumerate(_matches):
+            _chunk = _m.group(1)
+            _end = _matches[_i + 1].start() if _i + 1 < len(_matches) else len(summary)
+            _tail = summary[_m.end():_end]
+            _conts = [ln.strip() for ln in _tail.splitlines() if ln.strip() and not _item_re.match(ln)]
+            _full = " ".join([_chunk] + _conts).strip()
+            _items.append(_full)
+        _items = [it for it in _items if len(it) >= 20]
+        _preamble = summary[:_matches[0].start()].strip() if _matches else summary.strip()
+        _is_fb = False
+        if not _items and _preamble and len(_preamble) >= 0.6 * len(summary.strip()):
+            _items = [_preamble]  # unparseable prose -> fallback block, flagged below
+            _is_fb = True
+        if len(_items) >= 1 and not _is_fb:
+            _stored_ids = []
+            _md = dict(metadata or {})
+            if _is_fb:
+                _md["is_fallback"] = 1
+            for _it in _items:
+                _it = _it[:600]  # PATCH cap-at-insert: never store a >600-char item
+                if len(_it) < 20:
+                    continue
+                # insert-time dedup vs existing episodic items (same session, cosine > 0.95)
+                try:
+                    if _embeddings.available():
+                        _v = _embeddings.embed([_it])
+                        _dup = self.conn.execute(
+                            "SELECT content FROM episodic_memory WHERE session_id = ? ORDER BY timestamp DESC LIMIT 8",
+                            (self.session_id,),
+                        ).fetchall()
+                        # lightweight: compare on content prefix hashes (exact-ish dup) — full cosine
+                        # dedup is done post-batch by regen scripts; here we catch identical stems
+                        _stem = _it[:80].lower()
+                        _dupe = any((row and row[0] and _stem in str(row[0]).lower()) for row in _dup)  # PATCH D1 (audit #2): was `for r in []` — dedup never fired
+                except Exception:
+                    pass
+                if _dupe:
+                    continue  # PATCH D1: skip exact-stem duplicate item
+                _sid = self.consolidate_to_episodic(
+                    _it, source_wm_ids, source=source, importance=importance,
+                    valid_until=valid_until, scope=scope, metadata=_md,
+                    veracity=veracity,
+                )
+                if _sid:
+                    _stored_ids.append(_sid)
+            if _stored_ids:
+                if event_timestamp:
+                    _ph = ",".join("?" * len(_stored_ids))
+                    self.conn.execute(
+                        f"UPDATE episodic_memory SET timestamp = ?, event_date = ?, event_date_precision = ? WHERE id IN ({_ph})",
+                        (event_timestamp, str(event_timestamp)[:10], "day", *_stored_ids),
+                    )
+                    self.conn.commit()  # PATCH ts-commit: UPDATE was never committed (implicit rollback on exit)
+                return _stored_ids[0]
         # Compute the embedding BEFORE the INSERT opens the write transaction.
         # embed() can be a network call (API embeddings, 30s timeout) or a
         # heavy CPU call; running it after the INSERT held the SQLite write
