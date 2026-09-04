@@ -353,11 +353,22 @@ def _canonical_prefetch_rows(store: Any, owner_id: str, query: str, *, limit: in
 
 
 def _prefetch_topic_signal(row: Dict[str, Any]) -> float:
-    signal = max(
-        float(row.get("keyword_score") or 0.0),
-        float(row.get("fts_score") or 0.0),
-        float(row.get("dense_score") or 0.0),
-    )
+    # CALIBRATED 2026-08-27 on the real item pool: keyword_score is the ONLY
+    # discriminative component (pertinent items: kw 0.34-0.60, rank 1-2).
+    # dense_score is saturated (~0.96 for everything — the "Tu te souviens"
+    # form dominates embeddings) and must NOT gate. The blended score (0.10-0.29
+    # even for rank-1 relevant items) is not a usable floor either.
+    kw = float(row.get("keyword_score") or 0.0)
+    fts = float(row.get("fts_score") or 0.0)
+    signal = max(kw, fts)
+    if signal <= 0.0:
+        # recall() without component scores: fall back to the blended score with
+        # a calibration floor (relevant items score >= 0.10 at rank 1-2).
+        blended = float(row.get("score") or 0.0)
+        if _prefetch_is_raw(row):
+            signal = blended if blended >= 0.30 else 0.0
+        else:
+            signal = blended if blended >= 0.15 else 0.0
     if row.get("fact_match") or row.get("entity_match"):
         signal = max(signal, 0.20)
     return signal
