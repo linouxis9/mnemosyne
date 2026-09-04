@@ -6220,9 +6220,11 @@ class BeamMemory:
                     # Fallback: in-memory cosine similarity search
                     vec_rows = _in_memory_vec_search(self.conn, emb_result, k=max(top_k * 3, 20))
                 if vec_rows:
-                    max_distance = max(vr["distance"] for vr in vec_rows)
+                    _distances = [vr["distance"] for vr in vec_rows]  # PATCH vecnorm v2: normalize-by-worst crushed all non-nearest candidates to ~0 (episodic dense 0.000-0.011) — min-max over the batch keeps ordering AND spread
+                    _dmin, _dmax = min(_distances), max(_distances)
+                    _spread = _dmax - _dmin
                     for vr in vec_rows:
-                        sim = max(0.0, 1.0 - (vr["distance"] / max_distance)) if max_distance > 0 else 1.0
+                        sim = 1.0 if _spread <= 0 else max(0.0, (_dmax - vr["distance"]) / _spread)
                         vec_results[vr["rowid"]] = sim
 
         fts_results = {}
@@ -6331,7 +6333,8 @@ class BeamMemory:
             # candidate answers a broad natural-language query. Require enough
             # lexical coverage before admitting FTS-only episodic rows, while
             # still allowing genuinely strong vector-only hits through.
-            if lexical < min_relevance and sim < 0.65:
+            _em_vec_admit = float(__import__('os').environ.get('MNEMOSYNE_EM_VEC_ADMIT', '0.55'))  # PATCH vecnorm v2: 0.65 was on the crushed scale (only the nearest vec hit passed); 0.55 on min-max scale admits rank 2-10 semantic matches (calibrated: pertinent 0.6-1.0, noise <=0.4)
+            if lexical < min_relevance and sim < _em_vec_admit:
                 continue
             if self.episodic_graph is not None and not _env_disabled("MNEMOSYNE_GRAPH_BONUS"):
                 try:
