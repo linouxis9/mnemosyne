@@ -367,6 +367,30 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    """Parse a positive integer knob, falling back on empty/invalid values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning("%s is not a positive integer; using default %s", name, default)
+    return default
+
+
+# Conflict validation limits apply to one complete sleep(), not each source.
+# Invalid/nonpositive values use defaults; zero is not an unlimited budget.
+_CONFLICT_PAIR_BUDGET = _env_int("MNEMOSYNE_CONFLICT_PAIR_BUDGET", 20)
+_CONFLICT_TIME_BUDGET_S = _env_float("MNEMOSYNE_CONFLICT_TIME_BUDGET_S", 300.0)
+if not math.isfinite(_CONFLICT_TIME_BUDGET_S) or _CONFLICT_TIME_BUDGET_S <= 0:
+    logger.warning("MNEMOSYNE_CONFLICT_TIME_BUDGET_S must be finite and positive; using 300s")
+    _CONFLICT_TIME_BUDGET_S = 300.0
+
+
 # Veracity weighting (memory confidence)
 STATED_WEIGHT = _env_float("MNEMOSYNE_STATED_WEIGHT", _VW_DEFAULTS["stated"])
 INFERRED_WEIGHT = _env_float("MNEMOSYNE_INFERRED_WEIGHT", _VW_DEFAULTS["inferred"])
@@ -9259,7 +9283,7 @@ class BeamMemory:
         # a prior sleep so we don't re-summarize the same originals.
         # pinned = 1 items survive consolidation and stay in working memory.
         cursor.execute(f"""
-            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity
+            SELECT id, content, source, timestamp, importance, metadata_json, scope, valid_until, veracity, superseded_by
             FROM working_memory
             WHERE COALESCE(session_id, 'default') = ?
               AND timestamp < ?
@@ -9270,7 +9294,12 @@ class BeamMemory:
         """, (self.session_id, cutoff))
         rows = cursor.fetchall()
         if not rows:
-            return {"status": "no_op", "message": "No old working memories to consolidate"}
+            return {
+                "status": "no_op",
+                "message": "No old working memories to consolidate",
+                "conflicts_resolved": 0,
+                "conflicts_detected_only": 0,
+            }
 
         # Atomic claim: mark rows consolidated_at BEFORE writing the
         # episodic summary, gated on consolidated_at IS STILL NULL.
@@ -9314,7 +9343,12 @@ class BeamMemory:
             if not claimed_ids:
                 # Lost the race entirely.
                 self.conn.commit()
-                return {"status": "no_op", "message": "All eligible rows claimed by concurrent sleep"}
+                return {
+            "status": "no_op",
+            "message": "All eligible rows claimed by concurrent sleep",
+            "conflicts_resolved": 0,
+            "conflicts_detected_only": 0,
+        }
 
             # Filter rows to only those we successfully claimed.
             rows = [r for r in rows if r["id"] in claimed_ids]
@@ -9333,8 +9367,14 @@ class BeamMemory:
         summaries_created = 0
         llm_used_count = 0
         conflicts_resolved = 0
+        conflicts_detected_only = 0
         model_refresh_proposals = 0
         model_refresh_applied = 0
+        import time as _time
+
+        conflict_deadline = _time.monotonic() + _CONFLICT_TIME_BUDGET_S
+        conflict_calls = 0
+        superseded_older_ids = set()
         for source, items in grouped.items():
             lines = [item["content"] for item in items]
             ids = [item["id"] for item in items]
@@ -9363,35 +9403,98 @@ class BeamMemory:
             # --- Phase 1: heuristic conflict detection (no LLM) ---
             if len(items) >= 2:
                 conflicts = self._detect_conflicts(items)
+                # Account for every candidate up front; only a successful
+                # durable invalidation moves a pair into the resolved bucket.
+                conflicts_detected_only += len(conflicts)
                 from mnemosyne.core.llm_conflict_detector import (
                     LLM_CONFLICT_DETECTION_ENABLED,
+                    conflict_endpoint_is_safe,
                     validate_conflict_pair,
                 )
-                if LLM_CONFLICT_DETECTION_ENABLED:
+                if LLM_CONFLICT_DETECTION_ENABLED and conflict_endpoint_is_safe():
                     content_map = {item["id"]: item["content"] for item in items}
+                    pairs_skipped_budget = 0
                     for older_id, newer_id in conflicts:
-                        older_content = content_map.get(older_id, "")
-                        newer_content = content_map.get(newer_id, "")
-                        is_conflict, confidence, correct_fact = validate_conflict_pair(
-                            older_content,
-                            newer_content,
-                            session_id=self.session_id,
-                            db_path=self.db_path,
-                        )
-                        if is_conflict:
-                            if not dry_run:
-                                self.invalidate(older_id, replacement_id=newer_id)
+                        if dry_run or older_id in superseded_older_ids:
+                            continue
+                        if (conflict_calls >= _CONFLICT_PAIR_BUDGET
+                                or _time.monotonic() >= conflict_deadline):
+                            pairs_skipped_budget += 1
+                            continue
+                        conflict_calls += 1
+                        try:
+                            is_conflict, confidence, correct_fact = validate_conflict_pair(
+                                content_map.get(older_id, ""),
+                                content_map.get(newer_id, ""),
+                                session_id=self.session_id,
+                                db_path=self.db_path,
+                                deadline=conflict_deadline,
+                            )
+                            if is_conflict is not True:
+                                continue
+                            invalidated = self.invalidate(older_id, replacement_id=newer_id)
+                        except Exception:
+                            # Exceptions may contain prompts, URLs or credentials.
+                            logger.warning("Conflict validation/invalidation failed; pair left detected-only")
+                            continue
+                        if invalidated:
+                            superseded_older_ids.add(older_id)
                             conflicts_resolved += 1
+                            conflicts_detected_only -= 1
+                            try:
+                                self.conn.execute(
+                                    "INSERT INTO memory_validations"
+                                    " (memory_id, validator, action, new_content, note)"
+                                    " VALUES (?, ?, ?, ?, ?)",
+                                    (
+                                        older_id,
+                                        "llm_conflict",
+                                        "invalidated",
+                                        correct_fact or "",
+                                        json.dumps({
+                                            "confidence": confidence,
+                                            "replacement_id": newer_id,
+                                        }),
+                                    ),
+                                )
+                                self.conn.commit()
+                            except Exception:
+                                logger.debug("memory_validations insert failed")
+                    if pairs_skipped_budget:
+                        logger.warning(
+                            "conflict validation budget reached: %d pair(s)"
+                            " skipped this sleep", pairs_skipped_budget,
+                        )
+                elif LLM_CONFLICT_DETECTION_ENABLED:
+                    logger.warning(
+                        "Conflict LLM endpoint missing or unsafe; %d detected pair(s) left untouched",
+                        len(conflicts),
+                    )
                 else:
-                    for older_id, newer_id in conflicts:
-                        if not dry_run:
-                            self.invalidate(older_id, replacement_id=newer_id)
-                    conflicts_resolved += len(conflicts)
+                    # Heuristic-only detection must never invalidate. Cosine
+                    # similarity alone cannot distinguish a true contradiction
+                    # from a benign restatement of the same fact: in
+                    # production this branch silently expired 59% of the
+                    # memory pool (142/243 items) because weekly
+                    # consolidation kept re-storing similar-looking rows and
+                    # each pass invalidated the previous one with no log and
+                    # no recovery (valid_until excludes the row from recall
+                    # permanently). Log the pairs so operators can audit
+                    # them; actual invalidation stays reserved for the
+                    # LLM-validated path above.
+                    if conflicts:
+                        logger.info(
+                            "conflict heuristics: %d similar pair(s) detected, "
+                            "not auto-invalidating (LLM conflict validation disabled "
+                            "via %s); enable LLM validation to resolve conflicts",
+                            len(conflicts),
+                            "MNEMOSYNE_LLM_CONFLICT_DETECTION",
+                        )
 
             # --- Try LLM summarization (chunked to fit context) ---
             summary = None
             llm_succeeded = False
-            if local_llm.llm_available():
+            if not dry_run and local_llm.llm_available():
                 # --- Optional pre-compression for small local LLMs ---
                 # Uses CompressionPlugin (registered in plugins.py). The env
                 # var MNEMOSYNE_USE_CAVEMAN still works as a deprecated
@@ -9461,7 +9564,7 @@ class BeamMemory:
             proposals = []
             agent_context = str(getattr(self, "agent_context", "") or "").strip().lower()
             model_refresh_owner_id = str(getattr(self, "canonical_owner_id", "") or "").strip() or "default"
-            if agent_context != "cron":
+            if not dry_run and agent_context != "cron":
                 try:
                     from mnemosyne.core import model_refresh
                     proposals = model_refresh.infer_model_update_proposals(items)
@@ -9569,6 +9672,7 @@ class BeamMemory:
             "items_consolidated": len(consolidated_ids),
             "summaries_created": summaries_created,
             "conflicts_resolved": conflicts_resolved,
+            "conflicts_detected_only": conflicts_detected_only,
             "llm_used": llm_used_count,
             "method": method,
             "consolidated_ids": consolidated_ids,
@@ -9609,6 +9713,8 @@ class BeamMemory:
             return {
                 "status": "no_op",
                 "message": "No old working memories to consolidate",
+                "conflicts_resolved": 0,
+                "conflicts_detected_only": 0,
                 "sessions_scanned": 0,
                 "sessions_consolidated": 0,
                 "items_consolidated": 0,
@@ -9627,6 +9733,8 @@ class BeamMemory:
         errors = []
         model_refresh_proposals = 0
         model_refresh_applied = 0
+        conflicts_resolved = 0
+        conflicts_detected_only = 0
 
         for row in session_rows:
             session_id = row["session_id"] if hasattr(row, "keys") else row[0]
@@ -9662,6 +9770,8 @@ class BeamMemory:
                     items_consolidated += int(result.get("items_consolidated", 0) or 0)
                     summaries_created += int(result.get("summaries_created", 0) or 0)
                     llm_used += int(result.get("llm_used", 0) or 0)
+                    conflicts_resolved += int(result.get("conflicts_resolved", 0) or 0)
+                    conflicts_detected_only += int(result.get("conflicts_detected_only", 0) or 0)
                     refresh = result.get("model_refresh") or {}
                     model_refresh_proposals += int(refresh.get("proposals", 0) or 0)
                     model_refresh_applied += int(refresh.get("applied", 0) or 0)
@@ -9688,6 +9798,8 @@ class BeamMemory:
             "llm_used": llm_used,
             "errors": len(errors),
             "error_details": errors,
+            "conflicts_resolved": conflicts_resolved,
+            "conflicts_detected_only": conflicts_detected_only,
             "model_refresh": {
                 "proposals": model_refresh_proposals,
                 "applied": model_refresh_applied,
