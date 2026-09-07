@@ -294,6 +294,7 @@ class PolyphonicRecallEngine:
                 # PolyphonicRecallEngine inside _get_polyphonic_engine).
                 # Both directions are runtime-only.
                 from mnemosyne.core.beam import (
+    _classify_vec_store_regime,
                     _vec_available,
                     _effective_vec_type,
                 )
@@ -313,6 +314,21 @@ class PolyphonicRecallEngine:
                     # ultimately returns). vec_limit (which controls
                     # the numpy fallback's full-scan budget under
                     # BEAM_MODE) is irrelevant here.
+                    # Boundary routing (mirrors the linear engine): an
+                    # unmarked/legacy store must not run raw-L2 KNN — it
+                    # buries un-normalized rows. Abstain from the vec
+                    # voice and let the numpy full-scan fallback handle
+                    # dense candidates conservatively (exact cosine).
+                    try:
+                        _poly_regime = _classify_vec_store_regime(
+                            conn, "vec_episodes"
+                        )
+                    except Exception:
+                        _poly_regime = "unknown"
+                    if _poly_regime != "pure":
+                        vec_rows = []
+                    else:
+                        vec_rows = None  # fall through to the KNN below
                     k_inline = 60
                     if vec_type == "bit":
                         rank_sql = (
@@ -332,7 +348,10 @@ class PolyphonicRecallEngine:
                             f"WHERE embedding MATCH ? AND k={k_inline} "
                             "ORDER BY distance"
                         )
-                    vec_rows = conn.execute(rank_sql, (emb_json,)).fetchall()
+                    if vec_rows is None:
+                        vec_rows = conn.execute(
+                            rank_sql, (emb_json,)
+                        ).fetchall()
                     if vec_rows:
                         rowid_to_dist = {
                             r["rowid"]: r["distance"] for r in vec_rows
