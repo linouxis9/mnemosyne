@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+import logging
 import math
-
+import queue
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -179,6 +181,39 @@ class TestLegacyStoreClassification:
         assert after - before == 1, (
             f"expected exactly one legacy warning, got {after - before}"
         )
+
+    def test_unknown_marker_warning_is_thread_safe(self, monkeypatch, caplog):
+        callers = 8
+        start = threading.Barrier(callers)
+        outcomes = queue.Queue()
+
+        def call_warning():
+            try:
+                start.wait(timeout=5)
+                bm._warn_vec_store_unknown_once()
+            except Exception as exc:
+                outcomes.put(exc)
+            else:
+                outcomes.put(None)
+
+        monkeypatch.setattr(bm, "_unknown_marker_warning_emitted", False)
+        caplog.clear()
+        threads = [threading.Thread(target=call_warning) for _ in range(callers)]
+        with caplog.at_level(logging.WARNING, logger="mnemosyne.core.beam"):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert not any(thread.is_alive() for thread in threads)
+        results = [outcomes.get_nowait() for _ in threads]
+        assert results == [None] * callers
+        marker_warnings = [
+            record for record in caplog.records
+            if record.levelno == logging.WARNING
+            and "vec store format marker unreadable" in record.getMessage()
+        ]
+        assert len(marker_warnings) == 1
 
 
     @requires_vec
@@ -828,6 +863,11 @@ class TestBoundaryRoutingRegression:
             and "vec store format marker unreadable" in record.getMessage()
         ]
         assert len(marker_warnings) == 1
+        assert any(
+            record.levelno == logging.DEBUG
+            and "full-scan blob scoring this call" in record.getMessage()
+            for record in caplog.records
+        )
         assert not any(
             record.levelno == 20
             and "full-scan blob scoring this call" in record.getMessage()
