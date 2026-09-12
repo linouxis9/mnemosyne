@@ -76,6 +76,60 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
+def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
+    enhanced, monkeypatch, caplog
+):
+    memory, calls = enhanced
+    marker_reads = []
+    cache_calls = []
+
+    class CacheSpy:
+        def get_opaque(self, key):
+            cache_calls.append(("get", key))
+
+        def put_opaque(self, key, results):
+            cache_calls.append(("put", key, results))
+
+        def close(self):
+            pass
+
+    memory._query_cache = CacheSpy()
+    conn_type = type(memory.conn)
+    real_execute = conn_type.execute
+
+    def execute_without_user_version(conn, sql, parameters=(), *args, **kwargs):
+        normalized = (
+            sql.strip().rstrip(";").casefold() if isinstance(sql, str) else ""
+        )
+        if normalized == "pragma user_version":
+            marker_reads.append(sql)
+            raise RuntimeError("marker header unreadable")
+        return real_execute(conn, sql, parameters, *args, **kwargs)
+
+    monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+    monkeypatch.setattr(beam_module, "_unknown_marker_warning_emitted", False)
+
+    with caplog.at_level(logging.DEBUG, logger="mnemosyne.core.beam"):
+        first = _call(memory, "unknown marker")
+        second = _call(memory, "unknown marker")
+
+    assert len(marker_reads) == 2
+    assert len(calls) == 2
+    assert first != second
+    assert cache_calls == []
+    marker_warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "vec store format marker unreadable" in record.getMessage()
+    ]
+    assert len(marker_warnings) == 1
+    assert not any(
+        record.levelno == logging.INFO
+        and "full-scan blob scoring this call" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 @pytest.mark.parametrize("previous_version", [6, 7])
 def test_cache_version_bump_invalidates_staged_and_admission_entries(
     enhanced, monkeypatch, tmp_path: Path, previous_version: int

@@ -796,6 +796,8 @@ def _mark_vec_store_norm_bit(conn) -> None:
 
 
 _legacy_warning_emitted = False
+_unknown_marker_warning_emitted = False
+_unknown_marker_warning_lock = threading.Lock()
 
 
 def _warn_vec_store_legacy_once() -> None:
@@ -813,6 +815,21 @@ def _warn_vec_store_legacy_once() -> None:
         "candidates. Run reindex_vectors() once to normalize stored "
         "rows and switch to the fast KNN path."
     )
+
+
+def _warn_vec_store_unknown_once() -> None:
+    """Warn once per process when the normalized-format marker is unreadable."""
+    global _unknown_marker_warning_emitted
+    if _unknown_marker_warning_emitted:
+        return
+    with _unknown_marker_warning_lock:
+        if _unknown_marker_warning_emitted:
+            return
+        _unknown_marker_warning_emitted = True
+        logger.warning(
+            "vec store format marker unreadable: conservative exact-cosine "
+            "scan selected"
+        )
 
 
 def _env_vec_admit() -> float:
@@ -8559,12 +8576,8 @@ class BeamMemory:
                     if _regime == "legacy":
                         _warn_vec_store_legacy_once()
                     else:
-                        logger.warning(
-                            "vec store format marker unreadable: using the "
-                            "conservative full-scan exact-cosine route for "
-                            "episodic vector candidates this call"
-                        )
-                    logger.info(
+                        _warn_vec_store_unknown_once()
+                    logger.debug(
                         "vec store regime=%s: episodic candidates via "
                         "full-scan blob scoring this call",
                         _regime,
@@ -8692,7 +8705,7 @@ class BeamMemory:
                             sim = _vec_distance_sim(vr["distance"], _vec_type)
                         vec_results[vr["rowid"]] = sim
                 if explain and _explain_trace is not None:
-                    if _regime == "legacy":
+                    if _regime != "pure":
                         _explain_trace.set_vec_mode("legacy_scan")
                     elif _vec_type == "bit":
                         _explain_trace.set_vec_mode("knn_bit")
@@ -8702,8 +8715,8 @@ class BeamMemory:
                         _explain_trace.set_vec_mode("knn_int8")
                     else:
                         _explain_trace.set_vec_mode("in_memory")
-                if _regime == "legacy" and len(vec_results) > max(top_k * 3, 20):
-                    # Legacy full-scan produced more candidates than the
+                if _regime != "pure" and len(vec_results) > max(top_k * 3, 20):
+                    # Conservative full-scan produced more candidates than the
                     # KNN path ever would: keep the top-k by exact cosine
                     # so downstream IN() hydration stays bounded.
                     _keep = set(sorted(
@@ -9365,7 +9378,8 @@ class BeamMemory:
                 _uv & _VEC_NORM_BIT
             )
         except Exception as exc:
-            logger.warning(
+            _warn_vec_store_unknown_once()
+            logger.debug(
                 "enhanced-recall cache: user_version read failed (%s); "
                 "caching disabled for this call", type(exc).__name__,
             )

@@ -675,11 +675,8 @@ class TestBoundaryRoutingRegression:
     exact-cosine full scan."""
 
     @requires_vec
-    @pytest.mark.parametrize(
-        "marker_readable", [True, False], ids=["unmarked", "marker-read-error"]
-    )
     def test_mid_table_legacy_target_found_by_recall(
-            self, temp_db, monkeypatch, marker_readable):
+            self, temp_db, monkeypatch, caplog):
         import json as _json
         import sqlite3 as _sqlite3
         import sqlite_vec
@@ -768,30 +765,77 @@ class TestBoundaryRoutingRegression:
         monkeypatch.setattr(bm._embeddings, "embed_query", FakeEmb.embed_query)
         monkeypatch.setattr(bm._embeddings, "embed", FakeEmb.embed)
 
+        knn_calls = []
+        real_knn = bm._vec_search_with_blobs
+
+        def knn_spy(conn, emb, k=20):
+            knn_calls.append(k)
+            return real_knn(conn, emb, k)
+
+        monkeypatch.setattr(bm, "_vec_search_with_blobs", knn_spy)
+
+        legacy = beam.recall("mid-table legacy target zqxz", top_k=5)
+
         marker_reads = []
-        if not marker_readable:
-            conn_type = type(beam.conn)
-            real_execute = conn_type.execute
+        conn_type = type(beam.conn)
+        real_execute = conn_type.execute
 
-            def execute_without_user_version(
-                    conn, sql, parameters=(), *args, **kwargs):
-                normalized = (
-                    sql.strip().rstrip(";").casefold()
-                    if isinstance(sql, str)
-                    else ""
+        def execute_without_user_version(
+                conn, sql, parameters=(), *args, **kwargs):
+            normalized = (
+                sql.strip().rstrip(";").casefold()
+                if isinstance(sql, str)
+                else ""
+            )
+            if normalized == "pragma user_version":
+                marker_reads.append(sql)
+                raise _sqlite3.OperationalError("marker header unreadable")
+            return real_execute(conn, sql, parameters, *args, **kwargs)
+
+        monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+        monkeypatch.setattr(bm, "_unknown_marker_warning_emitted", False)
+        caplog.clear()
+        with caplog.at_level(10, logger="mnemosyne.core.beam"):
+            unknown_explained = beam.recall(
+                "mid-table legacy target zqxz", top_k=5, explain=True
+            )
+            unknown_again = beam.recall("mid-table legacy target zqxz", top_k=5)
+
+        assert len(marker_reads) == 2, "regression did not deny both marker reads"
+        assert unknown_explained["explain"].get("vec_mode") == "legacy_scan"
+        unknown = unknown_explained["results"]
+
+        def result_signature(results):
+            return [
+                (
+                    result["id"],
+                    {
+                        key: value
+                        for key, value in result.items()
+                        if key == "score" or key.endswith("_score")
+                    },
                 )
-                if normalized == "pragma user_version":
-                    marker_reads.append(sql)
-                    raise _sqlite3.OperationalError("marker header unreadable")
-                return real_execute(conn, sql, parameters, *args, **kwargs)
+                for result in results
+            ]
 
-            monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+        assert result_signature(unknown) == result_signature(legacy)
+        assert result_signature(unknown_again) == result_signature(legacy)
+        assert not knn_calls, "non-pure regimes must not use the raw-L2 KNN path"
 
-        res = beam.recall("mid-table legacy target zqxz", top_k=5)
-        if not marker_readable:
-            assert marker_reads, "regression did not deny the marker read"
+        marker_warnings = [
+            record for record in caplog.records
+            if record.levelno == 30
+            and "vec store format marker unreadable" in record.getMessage()
+        ]
+        assert len(marker_warnings) == 1
+        assert not any(
+            record.levelno == 20
+            and "full-scan blob scoring this call" in record.getMessage()
+            for record in caplog.records
+        )
+
         row = next(
-            (r for r in res if r.get("content") == "mid-table legacy target zqxz"),
+            (r for r in unknown if r.get("content") == "mid-table legacy target zqxz"),
             None,
         )
         assert row is not None, "mid-table legacy target missing from recall"
