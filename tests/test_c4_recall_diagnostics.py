@@ -663,7 +663,7 @@ class TestPolyphonicFallbackDiagnostics:
             def __getattr__(self, name):
                 return getattr(self._real, name)
 
-        fake_rows = [{"rowid": em_rowid, "distance": 0.0}]
+        fake_rows = [(em_rowid, 0.0, target_vec.tobytes())]
         fake_conn = _FakeVecConnection(beam.conn, fake_rows)
 
         # Force the sqlite-vec branch without the extension loaded.
@@ -671,7 +671,7 @@ class TestPolyphonicFallbackDiagnostics:
             "mnemosyne.core.beam._vec_available", lambda conn: True
         )
         monkeypatch.setattr(
-            "mnemosyne.core.beam._effective_vec_type", lambda conn: "f32"
+            "mnemosyne.core.beam._vec_table_type_strict", lambda conn: "float32"
         )
 
         engine = PolyphonicRecallEngine(db_path=temp_db, conn=fake_conn)
